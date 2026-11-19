@@ -57,7 +57,7 @@ const { items } = processCompanyJobs(res.jobs, res.ats, res.slug, { keywords: ['
 - Lever: `api.lever.co/v0/postings/{slug}?mode=json` (EU: `api.eu.lever.co`)
 - Ashby: `api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true`
 
-These are the public endpoints that each ATS documents for embedding job boards. Please keep the request rate polite. The CLI fetches at most 3 companies at a time and retries with backoff.
+These are the public endpoints that each ATS documents for embedding job boards. There's a fuller write-up of each API's fields, salary formats and gotchas in [Greenhouse, Lever and Ashby job board APIs: a practical guide](https://dougalpaw.com/guides/greenhouse-lever-ashby-job-apis/). Please keep the request rate polite. The CLI fetches at most 3 companies at a time and retries with backoff.
 
 ## Hosted version
 
