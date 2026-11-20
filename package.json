@@ -1,11 +1,11 @@
 {
   "name": "ats-jobs",
-  "version": "0.1.0",
-  "description": "Fetch every open job from Greenhouse, Lever and Ashby job boards through their public APIs, normalised to one schema. Zero dependencies.",
+  "version": "0.2.0",
+  "description": "Fetch every open job from Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee and Personio job boards through their public APIs, normalised to one schema. Zero dependencies.",
   "type": "module",
   "main": "core.js",
   "bin": { "ats-jobs": "cli.js" },
   "engines": { "node": ">=20" },
-  "keywords": ["greenhouse", "lever", "ashby", "jobs", "job-board", "ats", "careers", "api"],
+  "keywords": ["greenhouse", "lever", "ashby", "smartrecruiters", "recruitee", "personio", "jobs", "job-board", "ats", "careers", "api"],
   "license": "MIT"
 }
