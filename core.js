@@ -1,19 +1,19 @@
 // Core logic for ATS Jobs Feed. No Apify SDK here, so it can be tested with plain Node.
 
-export const USER_AGENT = 'ats-jobs/0.1 (+https://github.com/dougal-paw/ats-jobs)';
+export const USER_AGENT = 'ats-jobs/0.2 (+https://github.com/dougal-paw/ats-jobs)';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class NotFoundError extends Error {}
 
-/** GET JSON with retries on 429/5xx/network errors. Throws NotFoundError on 404. */
-export async function fetchJson(url, { retries = 3, timeoutMs = 30000 } = {}) {
+/** Shared GET-with-retry: retries 429/5xx/network errors, throws NotFoundError on 404. Returns the raw Response. */
+async function fetchWithRetry(url, { retries = 3, timeoutMs = 30000, accept } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
         if (attempt > 0) await sleep(1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250));
         try {
             const res = await fetch(url, {
-                headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+                headers: { 'User-Agent': USER_AGENT, ...(accept ? { Accept: accept } : {}) },
                 signal: AbortSignal.timeout(timeoutMs),
             });
             if (res.status === 404) throw new NotFoundError(`Not found (404): ${url}`);
@@ -24,10 +24,7 @@ export async function fetchJson(url, { retries = 3, timeoutMs = 30000 } = {}) {
                 continue;
             }
             if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
-            const body = await res.json();
-            // Lever answers unknown sites with {ok:false,error:"Document not found"} and a 404, but be defensive.
-            if (body && body.ok === false && /not found/i.test(body.error || '')) throw new NotFoundError(`Not found: ${url}`);
-            return body;
+            return res;
         } catch (err) {
             if (err instanceof NotFoundError) throw err;
             if (err instanceof Error && /^HTTP 4\d\d/.test(err.message)) throw err;
@@ -35,6 +32,21 @@ export async function fetchJson(url, { retries = 3, timeoutMs = 30000 } = {}) {
         }
     }
     throw lastErr;
+}
+
+/** GET JSON with retries on 429/5xx/network errors. Throws NotFoundError on 404. */
+export async function fetchJson(url, opts = {}) {
+    const res = await fetchWithRetry(url, { ...opts, accept: 'application/json' });
+    const body = await res.json();
+    // Lever answers unknown sites with {ok:false,error:"Document not found"} and a 404, but be defensive.
+    if (body && body.ok === false && /not found/i.test(body.error || '')) throw new NotFoundError(`Not found: ${url}`);
+    return body;
+}
+
+/** GET raw text (e.g. XML) with the same retry/backoff behaviour as fetchJson. */
+export async function fetchText(url, opts = {}) {
+    const res = await fetchWithRetry(url, opts);
+    return res.text();
 }
 
 // ---------- Company input parsing ----------
@@ -47,8 +59,14 @@ const ATS_ALIASES = {
     levereu: 'lever-eu',
     ashby: 'ashby',
     ashbyhq: 'ashby',
+    // workable: held back pending a terms check (fetcher/normaliser below are kept but unreachable).
+    smartrecruiters: 'smartrecruiters',
+    recruitee: 'recruitee',
+    personio: 'personio',
     auto: 'auto',
 };
+
+const SUPPORTED_ATS_LIST = 'greenhouse, lever, lever-eu, ashby, smartrecruiters, recruitee, personio or auto';
 
 function cleanSlug(s) {
     return decodeURIComponent(String(s || '').trim()).replace(/^\/+|\/+$/g, '').split(/[/?#]/)[0].trim();
@@ -93,6 +111,21 @@ export function parseCareersUrl(raw) {
         if (i >= 0 && parts[i + 1]) return { ats: 'ashby', slug: cleanSlug(parts[i + 1]) };
         return null;
     }
+    if (host === 'jobs.smartrecruiters.com' || host === 'careers.smartrecruiters.com') {
+        // companyId is case-sensitive; cleanSlug does not lowercase, so case is preserved.
+        if (!parts[0]) return null;
+        return { ats: 'smartrecruiters', slug: cleanSlug(parts[0]) };
+    }
+    if (/\.recruitee\.com$/.test(host)) {
+        const slug = host.replace(/\.recruitee\.com$/, '');
+        if (!slug) return null;
+        return { ats: 'recruitee', slug: cleanSlug(slug) };
+    }
+    if (/\.jobs\.personio\.(de|com)$/.test(host)) {
+        const slug = host.replace(/\.jobs\.personio\.(de|com)$/, '');
+        if (!slug) return null;
+        return { ats: 'personio', slug: cleanSlug(slug) };
+    }
     return null;
 }
 
@@ -105,7 +138,7 @@ const looksLikeUrl = (s) => /^https?:\/\//i.test(s) || /^[\w-]+(\.[\w-]+)+\//.te
 export function parseCompanyEntry(entry) {
     if (entry && typeof entry === 'object') {
         const ats = ATS_ALIASES[String(entry.ats || 'auto').toLowerCase().trim()];
-        if (!ats) throw new Error(`Unknown ATS "${entry.ats}". Use greenhouse, lever, lever-eu, ashby or auto.`);
+        if (!ats) throw new Error(`Unknown ATS "${entry.ats}". Use ${SUPPORTED_ATS_LIST}.`);
         const val = String(entry.slug || entry.url || '').trim();
         if (!val) throw new Error('Company entry has no "slug" or "url".');
         if (looksLikeUrl(val)) {
@@ -126,7 +159,7 @@ export function parseCompanyEntry(entry) {
     }
     if (looksLikeUrl(s)) {
         const parsed = parseCareersUrl(s);
-        if (!parsed) throw new Error(`Unsupported careers-page URL: ${s} (supported: Greenhouse, Lever, Ashby board URLs).`);
+        if (!parsed) throw new Error(`Unsupported careers-page URL: ${s} (supported: Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee and Personio board URLs).`);
         return { ...parsed, label: s };
     }
     return { ats: 'auto', slug: cleanSlug(s), label: s };
@@ -155,31 +188,109 @@ const fetchers = {
         );
         return Array.isArray(data?.jobs) ? data.jobs.filter((j) => j.isListed !== false) : [];
     },
+    async workable(slug) {
+        // ?details=true is required to get a non-empty description; every other field is identical either way.
+        const data = await fetchJson(`https://apply.workable.com/api/v1/widget/accounts/${encodeURIComponent(slug)}?details=true`);
+        const companyName = data?.name || null;
+        // The account display name lives on the parent response, not per-job; stash it on each raw job
+        // (an underscore-prefixed field, consumed only inside normaliseWorkable, never copied to output).
+        return Array.isArray(data?.jobs) ? data.jobs.map((j) => ({ ...j, _company: companyName })) : [];
+    },
+    async smartrecruiters(slug, opts = {}) {
+        const postings = [];
+        const limit = 100;
+        let offset = 0;
+        for (;;) {
+            const data = await fetchJson(
+                `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(slug)}/postings?limit=${limit}&offset=${offset}`,
+            );
+            const content = Array.isArray(data?.content) ? data.content : [];
+            postings.push(...content);
+            const total = Number(data?.totalFound) || 0;
+            offset += limit;
+            if (!content.length || offset >= total) break;
+        }
+        // Description and compensation are only on the per-posting detail endpoint. Fetching that for every
+        // posting is expensive on large boards (some have hundreds), so bound it to the newest N postings;
+        // the rest are still counted in totalJobs/jobsFound but get a null description and salary.
+        if (postings.length && opts.includeDescription !== false) {
+            const cap = Number(opts.maxJobsPerCompany) > 0 ? Number(opts.maxJobsPerCompany) : 50;
+            const targets = [...postings]
+                .sort((a, b) => (Date.parse(b.releasedDate || '') || 0) - (Date.parse(a.releasedDate || '') || 0))
+                .slice(0, cap);
+            await mapLimit(targets, 4, async (p) => {
+                try {
+                    // Attached as an underscore-prefixed field on the raw posting; normaliseSmartRecruiters
+                    // reads it but never spreads the raw detail payload (which carries creator/hiring-manager
+                    // info) into the normalised output.
+                    p._detail = await fetchJson(
+                        `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(slug)}/postings/${encodeURIComponent(p.id)}`,
+                    );
+                } catch {
+                    // Keep the posting without detail; description/compensation stay null for it.
+                }
+            });
+        }
+        return postings;
+    },
+    async recruitee(slug) {
+        const data = await fetchJson(`https://${slug}.recruitee.com/api/offers/`);
+        return Array.isArray(data?.offers) ? data.offers : [];
+    },
+    async personio(slug) {
+        let xml;
+        let host;
+        try {
+            xml = await fetchText(`https://${slug}.jobs.personio.de/xml`);
+            host = 'de';
+        } catch (err) {
+            if (!(err instanceof NotFoundError)) throw err;
+            xml = await fetchText(`https://${slug}.jobs.personio.com/xml`);
+            host = 'com';
+        }
+        // _host is needed later to build the job-detail/apply URL (the feed carries no URL fields at all).
+        return parsePersonioXml(xml).map((p) => ({ ...p, _host: host }));
+    },
 };
 
 /**
  * Resolve a company to an ATS and fetch its raw postings.
- * "lever" tries the global host and then the EU host. "auto" tries Greenhouse, Lever (global, EU) and Ashby,
- * and picks the first board that has jobs (or the first board that exists, if all are empty).
+ * "lever" tries the global host and then the EU host. "auto" tries Greenhouse, Lever (global, EU) and Ashby
+ * first (cheap, single-request checks); only if none of those have any jobs does it also try Workable,
+ * Recruitee and Personio. SmartRecruiters is deliberately excluded from auto-detect: its API returns 200
+ * with an empty list for almost any company id, so it can't be used to tell "exists" from "doesn't".
+ * Among whichever candidates do have jobs, the board with the most jobs is picked.
  */
-export async function fetchCompany({ ats, slug }) {
-    const order = ats === 'auto'
-        ? ['greenhouse', 'lever', 'lever-eu', 'ashby']
-        : ats === 'lever' ? ['lever', 'lever-eu'] : [ats];
+export async function fetchCompany({ ats, slug }, opts = {}) {
+    const AUTO_PRIMARY = ['greenhouse', 'lever', 'lever-eu', 'ashby'];
+    const AUTO_SECONDARY = ['recruitee', 'personio'];
+    const order = ats === 'auto' ? AUTO_PRIMARY : ats === 'lever' ? ['lever', 'lever-eu'] : [ats];
     let firstEmpty = null;
     const errors = [];
     const found = [];
-    for (const candidate of order) {
+
+    const tryOne = async (candidate) => {
         try {
-            const jobs = await fetchers[candidate](slug);
+            const jobs = await fetchers[candidate](slug, opts);
             if (jobs.length > 0) {
                 // Explicit ATS: first board with jobs wins. Auto: the same slug can exist on several ATSs
                 // (often an old or unrelated board), so check them all and keep the one with the most jobs.
-                if (ats !== 'auto') return { ats: candidate, slug, jobs };
+                if (ats !== 'auto') return { done: true, result: { ats: candidate, slug, jobs } };
                 found.push({ ats: candidate, slug, jobs });
             } else if (!firstEmpty) firstEmpty = { ats: candidate, slug, jobs };
         } catch (err) {
             if (!(err instanceof NotFoundError)) errors.push(`${candidate}: ${err.message}`);
+        }
+        return { done: false };
+    };
+
+    for (const candidate of order) {
+        const r = await tryOne(candidate);
+        if (r.done) return r.result;
+    }
+    if (ats === 'auto' && found.length === 0) {
+        for (const candidate of AUTO_SECONDARY) {
+            await tryOne(candidate);
         }
     }
     if (found.length) {
@@ -193,7 +304,48 @@ export async function fetchCompany({ ats, slug }) {
     }
     if (firstEmpty) return firstEmpty;
     if (errors.length) throw new Error(`Could not fetch "${slug}": ${errors.join('; ')}`);
-    throw new NotFoundError(`No ${ats === 'auto' ? 'Greenhouse, Lever or Ashby' : ats} job board found for "${slug}".`);
+    throw new NotFoundError(`No ${ats === 'auto' ? 'Greenhouse, Lever, Ashby, Recruitee or Personio' : ats} job board found for "${slug}".`);
+}
+
+// ---------- Personio XML parsing (hand-written: no XML dependency) ----------
+
+function extractTag(block, tag) {
+    const m = block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+    return m ? m[1] : null;
+}
+
+function unwrapCdata(raw) {
+    if (raw == null) return null;
+    const m = raw.match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+    return m ? m[1] : raw;
+}
+
+/** Parse Personio's public XML job feed into an array of raw position objects. */
+export function parsePersonioXml(xml) {
+    const positions = [];
+    const blocks = String(xml || '').match(/<position>[\s\S]*?<\/position>/g) || [];
+    for (const block of blocks) {
+        const descriptionsBlock = extractTag(block, 'jobDescriptions') || '';
+        const descriptions = [];
+        const descBlocks = descriptionsBlock.match(/<jobDescription>[\s\S]*?<\/jobDescription>/g) || [];
+        for (const db of descBlocks) {
+            descriptions.push({
+                name: decodeEntities(extractTag(db, 'name') || ''),
+                value: unwrapCdata(extractTag(db, 'value')),
+            });
+        }
+        positions.push({
+            id: extractTag(block, 'id'),
+            office: decodeEntities(extractTag(block, 'office') || ''),
+            department: decodeEntities(extractTag(block, 'department') || ''),
+            name: decodeEntities(unwrapCdata(extractTag(block, 'name')) || ''),
+            employmentType: extractTag(block, 'employmentType'),
+            schedule: extractTag(block, 'schedule'),
+            createdAt: extractTag(block, 'createdAt'),
+            descriptions,
+        });
+    }
+    return positions;
 }
 
 // ---------- Text helpers ----------
@@ -468,10 +620,193 @@ function normaliseAshby(j, slug) {
     };
 }
 
+/**
+ * Shared mapper for ATSs that split employment type across a type code (permanent/fixed_term/intern/
+ * freelance/temporary, or Recruitee's combined "fulltime_permanent" style code) and, optionally, a
+ * separate full-time/part-time schedule field. The more specific contract-type signal wins; a plain
+ * "permanent" (or no useful type at all) falls back to the schedule.
+ */
+function combinedEmploymentType(typeRaw, scheduleRaw) {
+    const s = String(typeRaw || '').toLowerCase().replace(/[\s-]+/g, '_');
+    if (s.includes('intern')) return 'internship';
+    if (s.includes('freelance')) return 'contract';
+    if (s.includes('fixed_term') || s.includes('fixedterm')) return 'contract';
+    if (s.includes('temp')) return 'temporary';
+    if (scheduleRaw) return normEmploymentType(scheduleRaw);
+    return normEmploymentType(typeRaw);
+}
+
+function workableSalaryRanges(j) {
+    const s = j.salary;
+    if (!s || typeof s !== 'object') return [];
+    const min = s.salary_from ?? s.min ?? null;
+    const max = s.salary_to ?? s.max ?? null;
+    if (min == null && max == null) return [];
+    return [{
+        min: min != null ? Number(min) : null,
+        max: max != null ? Number(max) : null,
+        currency: s.salary_currency ?? s.currency ?? null,
+        interval: normInterval(s.salary_period ?? s.period),
+        label: null,
+    }];
+}
+
+function normaliseWorkable(j, slug) {
+    const locs = Array.isArray(j.locations) && j.locations.length
+        ? j.locations.map((l) => uniq([l.city, l.region, l.country]).join(', '))
+        : [uniq([j.city, j.state, j.country]).join(', ')];
+    const locations = uniq(locs);
+    // Workable's widget API has no workplaceType field; telecommuting (+ location/title text) is all we get.
+    const isRemote = Boolean(j.telecommuting) || hasRemote(...locations, j.title);
+    const salaryRanges = workableSalaryRanges(j);
+    return {
+        jobId: String(j.shortcode || j.id),
+        ats: 'workable',
+        company: j._company || slug,
+        companySlug: slug,
+        title: String(j.title || '').trim(),
+        department: j.department || null,
+        team: null,
+        locations,
+        isRemote,
+        workplaceType: isRemote ? 'remote' : null,
+        employmentType: normEmploymentType(j.employment_type),
+        ...primarySalary(salaryRanges),
+        salaryRanges,
+        _html: decodeEntities(j.description || ''),
+        applyUrl: j.application_url || j.url || null,
+        jobUrl: j.url || j.shortlink || null,
+        publishedAt: toIso(j.published_on || j.created_at),
+        updatedAt: null,
+    };
+}
+
+function smartRecruitersSalaryRanges(detail) {
+    const c = detail?.compensation;
+    if (!c || (c.min == null && c.max == null)) return [];
+    return [{
+        min: c.min != null ? Number(c.min) : null,
+        max: c.max != null ? Number(c.max) : null,
+        currency: c.currency || null,
+        interval: normInterval(c.period),
+        label: null,
+    }];
+}
+
+function normaliseSmartRecruiters(j, slug) {
+    const detail = j._detail;
+    const loc = j.location || {};
+    const locations = uniq([loc.fullLocation || [loc.city, loc.region, loc.country].filter(Boolean).join(', ')]);
+    const isRemote = loc.remote === true;
+    const workplaceType = isRemote ? 'remote' : loc.hybrid ? 'hybrid' : loc.city ? 'onsite' : null;
+    // The bare company/id URL (no name slug) resolves fine; prefer the detail endpoint's canonical one when we have it.
+    const jobUrl = detail?.postingUrl || `https://jobs.smartrecruiters.com/${encodeURIComponent(slug)}/${encodeURIComponent(j.id)}`;
+    const sections = detail?.jobAd?.sections || {};
+    const html = decodeEntities(
+        Object.values(sections).map((s) => (s?.text ? `<h3>${s.title || ''}</h3>${s.text}` : '')).join(''),
+    );
+    const salaryRanges = smartRecruitersSalaryRanges(detail);
+    return {
+        jobId: String(j.id),
+        ats: 'smartrecruiters',
+        company: j.company?.name || slug,
+        companySlug: slug,
+        title: String(j.name || '').trim(),
+        department: j.department?.label || null,
+        team: j.function?.label || null,
+        locations,
+        isRemote,
+        workplaceType,
+        employmentType: normEmploymentType(j.typeOfEmployment?.label),
+        ...primarySalary(salaryRanges),
+        salaryRanges,
+        _html: html,
+        applyUrl: detail?.applyUrl || jobUrl,
+        jobUrl,
+        publishedAt: toIso(j.releasedDate),
+        updatedAt: null,
+    };
+}
+
+function recruiteeSalaryRanges(o) {
+    const s = o.salary;
+    if (!s) return [];
+    const min = s.min != null ? Number(s.min) : null;
+    const max = s.max != null ? Number(s.max) : null;
+    if (min == null && max == null) return [];
+    return [{ min, max, currency: s.currency || null, interval: normInterval(s.period), label: null }];
+}
+
+function normaliseRecruitee(o, slug) {
+    const locs = Array.isArray(o.locations) && o.locations.length
+        ? o.locations.map((l) => uniq([l.city || l.name, l.state, l.country]).join(', '))
+        : [o.location];
+    const locations = uniq(locs);
+    const workplaceType = o.remote ? 'remote' : o.hybrid ? 'hybrid' : o.on_site ? 'onsite' : null;
+    const isRemote = Boolean(o.remote) || hasRemote(...locations, o.title);
+    const salaryRanges = recruiteeSalaryRanges(o);
+    const html = decodeEntities(`${o.description || ''}${o.requirements ? `<h3>Requirements</h3>${o.requirements}` : ''}`);
+    return {
+        jobId: String(o.id),
+        ats: 'recruitee',
+        company: o.company_name || slug,
+        companySlug: slug,
+        title: String(o.title || '').trim(),
+        department: o.department || null,
+        team: null,
+        locations,
+        isRemote,
+        workplaceType: isRemote ? 'remote' : workplaceType,
+        employmentType: combinedEmploymentType(o.employment_type_code, null),
+        ...primarySalary(salaryRanges),
+        salaryRanges,
+        _html: html,
+        applyUrl: o.careers_apply_url || o.careers_url || null,
+        jobUrl: o.careers_url || null,
+        publishedAt: toIso(o.published_at || o.created_at),
+        updatedAt: toIso(o.updated_at),
+    };
+}
+
+function normalisePersonio(j, slug) {
+    const office = j.office || '';
+    const title = j.name || '';
+    const isRemote = hasRemote(office, title);
+    const html = decodeEntities(
+        (j.descriptions || []).map((d) => `<h3>${d.name || ''}</h3>${d.value || ''}`).join(''),
+    );
+    const host = j._host === 'com' ? 'com' : 'de';
+    const jobUrl = j.id ? `https://${slug}.jobs.personio.${host}/job/${encodeURIComponent(j.id)}` : null;
+    return {
+        jobId: String(j.id),
+        ats: 'personio',
+        company: slug,
+        companySlug: slug,
+        title: title.trim(),
+        department: j.department || null,
+        team: null,
+        locations: uniq([office]),
+        isRemote,
+        workplaceType: isRemote ? 'remote' : null,
+        employmentType: combinedEmploymentType(j.employmentType, j.schedule),
+        ...primarySalary([]),
+        salaryRanges: [],
+        _html: html,
+        applyUrl: jobUrl,
+        jobUrl,
+        publishedAt: toIso(j.createdAt),
+        updatedAt: null,
+    };
+}
+
 export function normaliseJob(raw, ats, slug) {
     if (ats === 'greenhouse') return normaliseGreenhouse(raw, slug);
     if (ats === 'lever' || ats === 'lever-eu') return normaliseLever(raw, slug, 'lever');
     if (ats === 'ashby') return normaliseAshby(raw, slug);
+    if (ats === 'workable') return normaliseWorkable(raw, slug);
+    if (ats === 'smartrecruiters') return normaliseSmartRecruiters(raw, slug);
+    if (ats === 'recruitee') return normaliseRecruitee(raw, slug);
+    if (ats === 'personio') return normalisePersonio(raw, slug);
     throw new Error(`Unknown ATS ${ats}`);
 }
 
