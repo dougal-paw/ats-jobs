@@ -1,6 +1,6 @@
-# ats-jobs: Greenhouse, Lever and Ashby jobs in one schema
+# ats-jobs: Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee and Personio jobs in one schema
 
-Fetch **every open job** from any company that hosts its careers page on **Greenhouse**, **Lever** (US or EU) or **Ashby**. It uses their official public job-board APIs, so there's no HTML scraping, no browser and no login. The results come back normalised to one flat schema: title, department, locations, a remote flag, salary range, apply URL and dates.
+Fetch **every open job** from any company that hosts its careers page on **Greenhouse**, **Lever** (US or EU), **Ashby**, **SmartRecruiters**, **Recruitee** or **Personio**. It uses their public job-board APIs and feeds, so there's no HTML scraping, no browser and no login. The results come back normalised to one flat schema: title, department, locations, a remote flag, salary range, apply URL and dates.
 
 - Zero dependencies. Node 20 or later, with one file of logic (`core.js`) and a small CLI.
 - Pass a careers-page URL, `ats:slug`, or just a bare slug and it works out which ATS the company uses.
@@ -40,7 +40,10 @@ Output is JSON Lines on stdout (use `--json` for one array). Progress and errors
 | `https://boards.greenhouse.io/airbnb`, `https://job-boards.greenhouse.io/airbnb` | Greenhouse `airbnb` |
 | `https://jobs.lever.co/zoox`, `lever:zoox`, `lever-eu:slug` | Lever (US or EU host) |
 | `https://jobs.ashbyhq.com/ramp`, `ashby:ramp` | Ashby `ramp` |
-| `ramp` | Auto: tries every ATS and keeps the board with the most jobs |
+| `https://jobs.smartrecruiters.com/Equinox`, `smartrecruiters:Equinox` | SmartRecruiters (case-sensitive id; never auto-detected, because its API answers for any id) |
+| `https://bunq.recruitee.com`, `recruitee:bunq` | Recruitee |
+| `https://clark.jobs.personio.de`, `personio:clark` | Personio (`.de`, then `.com`) |
+| `ramp` | Auto: tries Greenhouse, Lever and Ashby, then Recruitee and Personio, and keeps the board with the most jobs |
 
 ## As a library
 
@@ -56,8 +59,11 @@ const { items } = processCompanyJobs(res.jobs, res.ats, res.slug, { keywords: ['
 - Greenhouse: `boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true&pay_transparency=true`
 - Lever: `api.lever.co/v0/postings/{slug}?mode=json` (EU: `api.eu.lever.co`)
 - Ashby: `api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true`
+- SmartRecruiters: `api.smartrecruiters.com/v1/companies/{id}/postings` (descriptions need one detail call per posting, so only the newest `--max` (default 50) get them)
+- Recruitee: `{slug}.recruitee.com/api/offers/`
+- Personio: `{slug}.jobs.personio.de/xml` (XML, parsed without dependencies)
 
-These are the public endpoints that each ATS documents for embedding job boards. There's a fuller write-up of each API's fields, salary formats and gotchas in [Greenhouse, Lever and Ashby job board APIs: a practical guide](https://dougalpaw.com/guides/greenhouse-lever-ashby-job-apis/). Please keep the request rate polite. The CLI fetches at most 3 companies at a time and retries with backoff.
+These are the public endpoints each vendor provides for showing job listings elsewhere. There's a fuller write-up of each API's fields, salary formats and gotchas in [Greenhouse, Lever and Ashby job board APIs: a practical guide](https://dougalpaw.com/guides/greenhouse-lever-ashby-job-apis/). Please keep the request rate polite. The CLI fetches at most 3 companies at a time and retries with backoff.
 
 ## Hosted version
 
