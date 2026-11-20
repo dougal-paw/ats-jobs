@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Fetch every open job from companies on Greenhouse, Lever or Ashby, normalised to one schema.
+// Fetch every open job from companies on Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee or Personio, normalised to one schema.
 // Usage: node cli.js [options] <company>...   (company = careers-page URL, "ats:slug" or bare slug)
 import { parseCompanyEntry, fetchCompany, processCompanyJobs, mapLimit } from './core.js';
 
@@ -24,7 +24,8 @@ for (let i = 0; i < args.length; i++) {
 if (opts.help || !companies.length) {
     console.error(`Usage: node cli.js [options] <company>...
 
-  company           https://boards.greenhouse.io/airbnb, lever:zoox, ashby:ramp, or a bare slug (auto-detect)
+  company           https://boards.greenhouse.io/airbnb, lever:zoox, ashby:ramp, smartrecruiters:Equinox,
+                    recruitee:bunq, personio:clark, or a bare slug (auto-detect)
   -k, --keyword     match title/department (repeatable)
   -l, --location    match location text; "remote" also matches remote jobs (repeatable)
   -d, --department  match department or team (repeatable)
@@ -40,7 +41,7 @@ const all = [];
 let failed = 0;
 await mapLimit(companies, 3, async (entry) => {
     try {
-        const res = await fetchCompany(parseCompanyEntry(entry));
+        const res = await fetchCompany(parseCompanyEntry(entry), { includeDescription: opts.includeDescription, maxJobsPerCompany: opts.maxJobsPerCompany });
         const { items } = processCompanyJobs(res.jobs, res.ats, res.slug, opts);
         if (format === 'jsonl') for (const j of items) process.stdout.write(JSON.stringify(j) + '\n');
         else all.push(...items);
